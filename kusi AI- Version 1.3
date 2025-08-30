@@ -1,0 +1,574 @@
+#!/usr/bin/env python3
+"""
+mini_gpt_from_scratch.py
+
+A compact-yet-serious GPT-style language model implemented in pure PyTorch.
+Includes:
+  • Byte-level tokenizer (no external deps)
+  • Rotary positional embeddings (RoPE)
+  • Multi-head causal self-attention
+  • Pre-norm Transformer blocks with GELU MLP
+  • Mixed precision training (torch.cuda.amp)
+  • Gradient clipping, grad accumulation, cosine LR scheduler w/ warmup
+  • Checkpointing + resuming
+  • Text generation with temperature, top-k, top-p (nucleus)
+
+USAGE
+-----
+Train from a text file:
+    python mini_gpt_from_scratch.py train \
+        --data_path path/to/corpus.txt \
+        --out_dir runs/exp1 \
+        --device cuda \
+        --seq_len 256 --batch_size 32 \
+        --n_layer 8 --n_head 8 --d_model 512 --d_ff 2048 \
+        --lr 3e-4 --max_steps 20000 --warmup_steps 2000
+
+Generate text from a checkpoint:
+    python mini_gpt_from_scratch.py generate \
+        --ckpt runs/exp1/best.pt \
+        --prompt "Once upon a time" \
+        --max_new_tokens 200 --temperature 0.9 --top_p 0.9
+
+NOTE: This is a teaching/experimentation script. For large models/datasets, consider
+      distributed training and more robust tokenization.
+"""
+from __future__ import annotations
+
+import argparse
+import math
+import os
+import time
+from dataclasses import dataclass, asdict
+from typing import Optional, Tuple
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+# ------------------------
+# Tokenizer: byte-level
+# ------------------------
+class ByteTokenizer:
+    """Simple reversible byte-level tokenizer.
+    Maps each byte [0..255] to an integer token [0..255].
+    Adds optional special tokens for BOS/EOS.
+    """
+    def __init__(self, add_bos: bool = True, add_eos: bool = True):
+        self.add_bos = add_bos
+        self.add_eos = add_eos
+        # Reserve 256.. for specials
+        self.vocab_size = 256 + int(add_bos) + int(add_eos)
+        idx = 256
+        self.bos_id = idx if add_bos else None
+        idx += int(add_bos)
+        self.eos_id = idx if add_eos else None
+
+    def encode(self, s: str) -> torch.Tensor:
+        b = s.encode('utf-8')
+        ids = list(b)
+        if self.add_bos:
+            ids = [self.bos_id] + ids
+        if self.add_eos:
+            ids = ids + [self.eos_id]
+        return torch.tensor(ids, dtype=torch.long)
+
+    def decode(self, ids: torch.Tensor) -> str:
+        ids = ids.tolist() if isinstance(ids, torch.Tensor) else list(ids)
+        filtered = []
+        for t in ids:
+            if t is None:
+                continue
+            if t < 256:
+                filtered.append(t)
+        return bytes(filtered).decode('utf-8', errors='ignore')
+
+# ------------------------
+# Dataset
+# ------------------------
+class TextFileDataset(Dataset):
+    def __init__(self, path: str, seq_len: int, tokenizer: ByteTokenizer, split: str = 'train', split_ratio: float = 0.98):
+        with open(path, 'r', encoding='utf-8') as f:
+            text = f.read()
+        ids = tokenizer.encode(text)
+        # simple train/val split
+        n = int(len(ids) * split_ratio)
+        if split == 'train':
+            self.tokens = ids[:n]
+        else:
+            self.tokens = ids[n:]
+        self.seq_len = seq_len
+
+    def __len__(self):
+        return max(1, len(self.tokens) - self.seq_len)
+
+    def __getitem__(self, idx):
+        x = self.tokens[idx: idx + self.seq_len]
+        y = self.tokens[idx + 1: idx + 1 + self.seq_len]
+        return x, y
+
+# ------------------------
+# Rotary embeddings utilities
+# ------------------------
+# Adapted conceptually from RoPE paper and open-source implementations.
+
+def _build_rope_cache(d_head: int, max_seq_len: int, device: torch.device, base: float = 10000.0):
+    # Pairwise dims
+    assert d_head % 2 == 0, "d_head must be even for RoPE"
+    half = d_head // 2
+    # Compute theta: shape (half,)
+    inv_freq = 1.0 / (base ** (torch.arange(0, half, device=device, dtype=torch.float32) / half))
+    # Positions: (max_seq_len,)
+    t = torch.arange(max_seq_len, device=device, dtype=torch.float32)
+    freqs = torch.einsum('i,j->ij', t, inv_freq)  # (max_seq_len, half)
+    # Precompute cos/sin
+    cos = freqs.cos()  # (max_seq_len, half)
+    sin = freqs.sin()  # (max_seq_len, half)
+    return cos, sin
+
+
+def _apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """Apply RoPE to last dimension pairs of x.
+    x: (B, n_head, T, d_head)
+    cos/sin: (T, half)
+    """
+    B, H, T, Dh = x.shape
+    half = Dh // 2
+    x1, x2 = x[..., :half], x[..., half:]
+    # Expand cos/sin to (1,1,T,half)
+    cos_e = cos[:T].unsqueeze(0).unsqueeze(0)
+    sin_e = sin[:T].unsqueeze(0).unsqueeze(0)
+    # Rotate
+    x_rotated = torch.cat([x1 * cos_e - x2 * sin_e, x1 * sin_e + x2 * cos_e], dim=-1)
+    return x_rotated
+
+# ------------------------
+# Model
+# ------------------------
+class CausalSelfAttention(nn.Module):
+    def __init__(self, d_model: int, n_head: int, attn_dropout: float, resid_dropout: float, rope: bool, max_seq_len: int):
+        super().__init__()
+        assert d_model % n_head == 0
+        self.d_model = d_model
+        self.n_head = n_head
+        self.d_head = d_model // n_head
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.proj = nn.Linear(d_model, d_model, bias=False)
+        self.attn_drop = nn.Dropout(attn_dropout)
+        self.resid_drop = nn.Dropout(resid_dropout)
+        # causal mask (registered buffer for export)
+        mask = torch.tril(torch.ones(max_seq_len, max_seq_len)).view(1, 1, max_seq_len, max_seq_len)
+        self.register_buffer('mask', mask)
+        self.use_rope = rope
+        if rope:
+            # build at runtime based on device
+            self.rope_cache = None  # (cos, sin)
+            self.max_seq_len = max_seq_len
+
+    def _maybe_build_rope(self, device: torch.device):
+        if not self.use_rope:
+            return None
+        if (self.rope_cache is None) or (self.rope_cache[0].device != device):
+            cos, sin = _build_rope_cache(self.d_head, self.max_seq_len, device=device)
+            self.rope_cache = (cos, sin)
+        return self.rope_cache
+
+    def forward(self, x: torch.Tensor):
+        B, T, C = x.shape
+        qkv = self.qkv(x)  # (B, T, 3C)
+        q, k, v = qkv.split(self.d_model, dim=-1)
+        # reshape to heads
+        q = q.view(B, T, self.n_head, self.d_head).transpose(1, 2)  # (B,H,T,Dh)
+        k = k.view(B, T, self.n_head, self.d_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, self.d_head).transpose(1, 2)
+
+        if self.use_rope:
+            cos, sin = self._maybe_build_rope(x.device)
+            q = _apply_rope(q, cos, sin)
+            k = _apply_rope(k, cos, sin)
+
+        # attention scores
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(self.d_head)  # (B,H,T,T)
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float('-inf'))
+        att = F.softmax(att, dim=-1)
+        att = self.attn_drop(att)
+        y = att @ v  # (B,H,T,Dh)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        y = self.resid_drop(self.proj(y))
+        return y
+
+
+class MLP(nn.Module):
+    def __init__(self, d_model: int, d_ff: int, resid_dropout: float):
+        super().__init__()
+        self.fc1 = nn.Linear(d_model, d_ff)
+        self.fc2 = nn.Linear(d_ff, d_model)
+        self.drop = nn.Dropout(resid_dropout)
+
+    def forward(self, x):
+        return self.drop(self.fc2(F.gelu(self.fc1(x))))
+
+
+class Block(nn.Module):
+    def __init__(self, d_model: int, n_head: int, d_ff: int, attn_dropout: float, resid_dropout: float, rope: bool, max_seq_len: int):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(d_model)
+        self.attn = CausalSelfAttention(d_model, n_head, attn_dropout, resid_dropout, rope, max_seq_len)
+        self.ln2 = nn.LayerNorm(d_model)
+        self.mlp = MLP(d_model, d_ff, resid_dropout)
+
+    def forward(self, x):
+        x = x + self.attn(self.ln1(x))
+        x = x + self.mlp(self.ln2(x))
+        return x
+
+
+class MiniGPT(nn.Module):
+    def __init__(self, vocab_size: int, d_model: int, n_layer: int, n_head: int, d_ff: int, max_seq_len: int, attn_dropout: float = 0.0, resid_dropout: float = 0.0, rope: bool = True):
+        super().__init__()
+        self.max_seq_len = max_seq_len
+        self.tok_emb = nn.Embedding(vocab_size, d_model)
+        self.pos_emb = nn.Parameter(torch.zeros(1, max_seq_len, d_model))  # learnable
+        self.drop = nn.Dropout(resid_dropout)
+        self.blocks = nn.ModuleList([
+            Block(d_model, n_head, d_ff, attn_dropout, resid_dropout, rope, max_seq_len) for _ in range(n_layer)
+        ])
+        self.ln_f = nn.LayerNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            nn.init.normal_(module.weight, mean=0.0, std=0.02)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            nn.init.zeros_(module.bias)
+
+    def forward(self, idx: torch.Tensor, targets: Optional[torch.Tensor] = None):
+        B, T = idx.shape
+        assert T <= self.max_seq_len, "Sequence length exceeds model's max_seq_len"
+        tok = self.tok_emb(idx)
+        pos = self.pos_emb[:, :T, :]
+        x = self.drop(tok + pos)
+        for blk in self.blocks:
+            x = blk(x)
+        x = self.ln_f(x)
+        logits = self.head(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx: torch.Tensor, max_new_tokens: int, temperature: float = 1.0, top_k: Optional[int] = None, top_p: Optional[float] = None):
+        self.eval()
+        for _ in range(max_new_tokens):
+            idx_cond = idx[:, -self.max_seq_len:]
+            logits, _ = self(idx_cond)
+            logits = logits[:, -1, :] / max(1e-6, temperature)
+            probs = F.softmax(logits, dim=-1)
+            if top_k is not None:
+                v, ix = torch.topk(probs, top_k)
+                mask = torch.full_like(probs, float('-inf'))
+                mask.scatter_(1, ix, torch.log(v))
+                logits = mask
+                probs = F.softmax(logits, dim=-1)
+            if top_p is not None:
+                sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+                cumulative = torch.cumsum(sorted_probs, dim=-1)
+                cutoff = (cumulative > top_p).float().argmax(dim=-1)
+                # build mask
+                mask = torch.ones_like(probs) * float('-inf')
+                for b in range(probs.size(0)):
+                    k = cutoff[b].item()
+                    idxs = sorted_indices[b, :k+1]
+                    mask[b, idxs] = torch.log(probs[b, idxs])
+                logits = mask
+                probs = F.softmax(logits, dim=-1)
+            next_id = torch.multinomial(probs, num_samples=1)
+            idx = torch.cat([idx, next_id], dim=1)
+        return idx
+
+# ------------------------
+# Training utilities
+# ------------------------
+@dataclass
+class TrainConfig:
+    data_path: str
+    out_dir: str = 'runs/exp'
+    device: str = 'cuda' if torch.cuda.is_available() else 'cpu'
+    seed: int = 1337
+    seq_len: int = 256
+    batch_size: int = 32
+    n_layer: int = 8
+    n_head: int = 8
+    d_model: int = 512
+    d_ff: int = 2048
+    attn_dropout: float = 0.1
+    resid_dropout: float = 0.1
+    rope: bool = True
+    lr: float = 3e-4
+    weight_decay: float = 0.1
+    max_steps: int = 20000
+    warmup_steps: int = 2000
+    grad_clip: float = 1.0
+    grad_accum: int = 1
+    log_interval: int = 50
+    eval_interval: int = 500
+    eval_iters: int = 200
+    amp: bool = True
+    save_best: bool = True
+
+
+def set_seed(seed: int):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def create_model(cfg: TrainConfig, vocab_size: int):
+    model = MiniGPT(
+        vocab_size=vocab_size,
+        d_model=cfg.d_model,
+        n_layer=cfg.n_layer,
+        n_head=cfg.n_head,
+        d_ff=cfg.d_ff,
+        max_seq_len=cfg.seq_len,
+        attn_dropout=cfg.attn_dropout,
+        resid_dropout=cfg.resid_dropout,
+        rope=cfg.rope,
+    )
+    return model
+
+
+def configure_optimizers(model: nn.Module, lr: float, weight_decay: float):
+    decay, no_decay = [], []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        if p.ndim >= 2 and 'pos_emb' not in name:
+            decay.append(p)
+        else:
+            no_decay.append(p)
+    optim_groups = [
+        {'params': decay, 'weight_decay': weight_decay},
+        {'params': no_decay, 'weight_decay': 0.0},
+    ]
+    optimizer = torch.optim.AdamW(optim_groups, lr=lr, betas=(0.9, 0.95), eps=1e-8)
+    return optimizer
+
+
+def cosine_warmup_lr(step: int, base_lr: float, warmup: int, max_steps: int):
+    if step < warmup:
+        return base_lr * step / max(1, warmup)
+    progress = (step - warmup) / max(1, max_steps - warmup)
+    return 0.5 * base_lr * (1 + math.cos(math.pi * progress))
+
+
+def estimate_loss(model: nn.Module, loader: DataLoader, device: torch.device, iters: int) -> float:
+    model.eval()
+    losses = []
+    with torch.no_grad():
+        for i, (x, y) in enumerate(loader):
+            if i >= iters:
+                break
+            x, y = x.to(device), y.to(device)
+            _, loss = model(x, y)
+            losses.append(loss.item())
+    model.train()
+    return sum(losses) / max(1, len(losses))
+
+
+def train(cfg: TrainConfig):
+    os.makedirs(cfg.out_dir, exist_ok=True)
+    set_seed(cfg.seed)
+
+    tokenizer = ByteTokenizer(add_bos=True, add_eos=True)
+    train_ds = TextFileDataset(cfg.data_path, cfg.seq_len, tokenizer, split='train')
+    val_ds = TextFileDataset(cfg.data_path, cfg.seq_len, tokenizer, split='val')
+
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True, drop_last=True)
+    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False, drop_last=False)
+
+    device = torch.device(cfg.device)
+    model = create_model(cfg, tokenizer.vocab_size).to(device)
+    optimizer = configure_optimizers(model, cfg.lr, cfg.weight_decay)
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp and device.type == 'cuda')
+
+    best_val = float('inf')
+    global_step = 0
+    t0 = time.time()
+
+    while global_step < cfg.max_steps:
+        for x, y in train_loader:
+            global_step += 1
+            x, y = x.to(device), y.to(device)
+
+            lr = cosine_warmup_lr(global_step, cfg.lr, cfg.warmup_steps, cfg.max_steps)
+            for pg in optimizer.param_groups:
+                pg['lr'] = lr
+
+            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                _, loss = model(x, y)
+            scaler.scale(loss / cfg.grad_accum).backward()
+
+            if global_step % cfg.grad_accum == 0:
+                if cfg.grad_clip is not None:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+
+            if global_step % cfg.log_interval == 0:
+                elapsed = time.time() - t0
+                print(f"step {global_step:6d} | loss {loss.item():.4f} | lr {lr:.2e} | {elapsed:.1f}s")
+
+            if global_step % cfg.eval_interval == 0:
+                val_loss = estimate_loss(model, val_loader, device, cfg.eval_iters)
+                print(f"eval step {global_step:6d} | val_loss {val_loss:.4f}")
+                if cfg.save_best and val_loss < best_val:
+                    best_val = val_loss
+                    ckpt_path = os.path.join(cfg.out_dir, 'best.pt')
+                    torch.save({
+                        'model_state': model.state_dict(),
+                        'config': asdict(cfg),
+                        'vocab_size': tokenizer.vocab_size,
+                        'best_val': best_val,
+                    }, ckpt_path)
+                    print(f"saved best checkpoint to {ckpt_path}")
+
+            if global_step >= cfg.max_steps:
+                break
+
+    # final save
+    final_path = os.path.join(cfg.out_dir, 'final.pt')
+    torch.save({
+        'model_state': model.state_dict(),
+        'config': asdict(cfg),
+        'vocab_size': tokenizer.vocab_size,
+        'best_val': best_val,
+    }, final_path)
+    print(f"training complete. saved final checkpoint to {final_path}")
+
+
+# ------------------------
+# CLI
+# ------------------------
+
+def parse_args():
+    p = argparse.ArgumentParser(description='Train or generate with a mini GPT from scratch.')
+    sub = p.add_subparsers(dest='cmd', required=True)
+
+    # train
+    pt = sub.add_parser('train', help='Train a model')
+    pt.add_argument('--data_path', type=str, required=True)
+    pt.add_argument('--out_dir', type=str, default='runs/exp')
+    pt.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    pt.add_argument('--seed', type=int, default=1337)
+    pt.add_argument('--seq_len', type=int, default=256)
+    pt.add_argument('--batch_size', type=int, default=32)
+    pt.add_argument('--n_layer', type=int, default=8)
+    pt.add_argument('--n_head', type=int, default=8)
+    pt.add_argument('--d_model', type=int, default=512)
+    pt.add_argument('--d_ff', type=int, default=2048)
+    pt.add_argument('--attn_dropout', type=float, default=0.1)
+    pt.add_argument('--resid_dropout', type=float, default=0.1)
+    pt.add_argument('--rope', action='store_true')
+    pt.add_argument('--no-rope', dest='rope', action='store_false')
+    pt.set_defaults(rope=True)
+    pt.add_argument('--lr', type=float, default=3e-4)
+    pt.add_argument('--weight_decay', type=float, default=0.1)
+    pt.add_argument('--max_steps', type=int, default=20000)
+    pt.add_argument('--warmup_steps', type=int, default=2000)
+    pt.add_argument('--grad_clip', type=float, default=1.0)
+    pt.add_argument('--grad_accum', type=int, default=1)
+    pt.add_argument('--log_interval', type=int, default=50)
+    pt.add_argument('--eval_interval', type=int, default=500)
+    pt.add_argument('--eval_iters', type=int, default=200)
+    pt.add_argument('--amp', action='store_true')
+    pt.add_argument('--no-amp', dest='amp', action='store_false')
+    pt.set_defaults(amp=True)
+    pt.add_argument('--save_best', action='store_true')
+    pt.add_argument('--no-save_best', dest='save_best', action='store_false')
+    pt.set_defaults(save_best=True)
+
+    # generate
+    pg = sub.add_parser('generate', help='Generate text from a checkpoint')
+    pg.add_argument('--ckpt', type=str, required=True)
+    pg.add_argument('--prompt', type=str, default='')
+    pg.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu')
+    pg.add_argument('--max_new_tokens', type=int, default=200)
+    pg.add_argument('--temperature', type=float, default=1.0)
+    pg.add_argument('--top_k', type=int, default=None)
+    pg.add_argument('--top_p', type=float, default=None)
+
+    return p.parse_args()
+
+
+def cmd_train(args):
+    cfg = TrainConfig(
+        data_path=args.data_path,
+        out_dir=args.out_dir,
+        device=args.device,
+        seed=args.seed,
+        seq_len=args.seq_len,
+        batch_size=args.batch_size,
+        n_layer=args.n_layer,
+        n_head=args.n_head,
+        d_model=args.d_model,
+        d_ff=args.d_ff,
+        attn_dropout=args.attn_dropout,
+        resid_dropout=args.resid_dropout,
+        rope=args.rope,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        max_steps=args.max_steps,
+        warmup_steps=args.warmup_steps,
+        grad_clip=args.grad_clip,
+        grad_accum=args.grad_accum,
+        log_interval=args.log_interval,
+        eval_interval=args.eval_interval,
+        eval_iters=args.eval_iters,
+        amp=args.amp,
+        save_best=args.save_best,
+    )
+    print('TrainConfig:', cfg)
+    train(cfg)
+
+
+def cmd_generate(args):
+    device = torch.device(args.device)
+    ckpt = torch.load(args.ckpt, map_location=device)
+    cfg_dict = ckpt.get('config', None)
+    vocab_size = ckpt.get('vocab_size', 258)
+
+    class DummyCfg:
+        pass
+    dummy = DummyCfg()
+    dummy.seq_len = cfg_dict['seq_len'] if cfg_dict else 256
+    dummy.d_model = cfg_dict['d_model'] if cfg_dict else 512
+    dummy.n_layer = cfg_dict['n_layer'] if cfg_dict else 8
+    dummy.n_head = cfg_dict['n_head'] if cfg_dict else 8
+    dummy.d_ff = cfg_dict['d_ff'] if cfg_dict else 2048
+    dummy.attn_dropout = 0.0
+    dummy.resid_dropout = 0.0
+
+    model = MiniGPT(vocab_size, dummy.d_model, dummy.n_layer, dummy.n_head, dummy.d_ff, dummy.seq_len)
+    model.load_state_dict(ckpt['model_state'])
+    model.to(device)
+    model.eval()
+
+    tokenizer = ByteTokenizer(add_bos=True, add_eos=True)
+    prompt_ids = tokenizer.encode(args.prompt).to(device).unsqueeze(0)
+
+    with torch.no_grad():
+        out = model.generate(prompt_ids, max_new_tokens=args.max_new_tokens, temperature=args.temperature, top_k=args.top_k, top_p=args.top_p)
+    print(tokenizer.decode(out[0]))
+
+
+if __name__ == '__main__':
+    args = parse_args()
+    if args.cmd == 'train':
+        cmd_train(args)
+    elif args.cmd == 'generate':
+        cmd_generate(args)
