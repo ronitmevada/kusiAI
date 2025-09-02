@@ -175,3 +175,119 @@ class Config:
         cfg = Config()
         merge(cfg, raw)
         return cfg
+
+# -------------------------
+# Simple tokenizer & vocab
+# -------------------------
+class BasicTokenizer:
+    def __init__(self):
+        self.pattern = re.compile(r"\w+|[^\w\s]", re.UNICODE)
+    def __call__(self, text: str) -> List[str]:
+        text = text.lower()
+        return self.pattern.findall(text)
+
+PAD, UNK, BOS, EOS = "<pad>", "<unk>", "<bos>", "<eos>"
+
+class Vocab:
+    def __init__(self, min_freq=2, max_size=30000):
+        self.min_freq = min_freq
+        self.max_size = max_size
+        self.freqs: Dict[str, int] = {}
+        self.itos: List[str] = []
+        self.stoi: Dict[str, int] = {}
+
+    def build(self, texts: Iterable[str]):
+        tok = BasicTokenizer()
+        for t in texts:
+            for w in tok(t):
+                self.freqs[w] = self.freqs.get(w, 0) + 1
+        # special tokens
+        specials = [PAD, UNK, BOS, EOS]
+        vocab = specials + [w for w, c in sorted(self.freqs.items(), key=lambda x: (-x[1], x[0])) if c >= self.min_freq]
+        if len(vocab) > self.max_size:
+            vocab = vocab[: self.max_size]
+        self.itos = vocab
+        self.stoi = {w: i for i, w in enumerate(self.itos)}
+
+    def __len__(self):
+        return len(self.itos)
+
+    def encode(self, text: str, max_len: int) -> List[int]:
+        tok = BasicTokenizer()
+        ids = [self.stoi.get(w, self.stoi.get(UNK, 1)) for w in tok(text)]
+        ids = [self.stoi.get(BOS, 2)] + ids + [self.stoi.get(EOS, 3)]
+        if len(ids) < max_len:
+            ids = ids + [self.stoi.get(PAD, 0)] * (max_len - len(ids))
+        else:
+            ids = ids[:max_len]
+        return ids
+
+# -------------------------
+# Data loading
+# -------------------------
+class TextClassificationDataset(Dataset):
+    def __init__(self, records: List[Tuple[str, int]], vocab: Vocab, max_len: int):
+        self.records = records
+        self.vocab = vocab
+        self.max_len = max_len
+    def __len__(self):
+        return len(self.records)
+    def __getitem__(self, idx):
+        text, label = self.records[idx]
+        ids = torch.tensor(self.vocab.encode(text, self.max_len), dtype=torch.long)
+        return ids, torch.tensor(label, dtype=torch.long)
+
+
+def read_folder_dataset(path: str) -> Tuple[List[str], List[int], List[str]]:
+    classes = sorted([d.name for d in pathlib.Path(path).iterdir() if d.is_dir()])
+    label2id = {c: i for i, c in enumerate(classes)}
+    texts, labels = [], []
+    for c in classes:
+        for fp in pathlib.Path(path, c).glob("**/*.txt"):
+            txt = fp.read_text(encoding='utf-8', errors='ignore')
+            texts.append(txt)
+            labels.append(label2id[c])
+    return texts, labels, classes
+
+
+def read_tabular_dataset(path: str, text_key: str, label_key: str) -> Tuple[List[str], List[int], List[str]]:
+    texts, labels = [], []
+    classes: List[str] = []
+    ext = pathlib.Path(path).suffix.lower()
+    def add_label(l):
+        nonlocal classes
+        if l not in classes:
+            classes.append(l)
+        return classes.index(l)
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            if not line.strip():
+                continue
+            if ext == '.jsonl':
+                obj = json.loads(line)
+            else:
+                # simplistic CSV (comma in text may break; use JSONL for safety)
+                parts = [p.strip() for p in line.split(',')]
+                if len(parts) < 2:
+                    # header or malformed line
+                    if text_key in line and label_key in line:
+                        continue
+                    else:
+                        # try tab
+                        parts = [p.strip() for p in line.split('\t')]
+                        if len(parts) < 2:
+                            continue
+                obj = {text_key: parts[0], label_key: parts[1]}
+            t = str(obj[text_key])
+            l = str(obj[label_key])
+            texts.append(t)
+            labels.append(add_label(l))
+    return texts, labels, classes
+
+
+def load_dataset(path: str, text_key: str, label_key: str) -> Tuple[List[str], List[int], List[str]]:
+    p = pathlib.Path(path)
+    if p.is_dir():
+        return read_folder_dataset(path)
+    return read_tabular_dataset(path, text_key, label_key)
+
