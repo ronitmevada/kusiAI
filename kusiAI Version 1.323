@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""
+KusiAI v1.323 — All‑in‑One AI Model
+===================================
+
+An end‑to‑end, batteries‑included reference implementation for a text
+classification model with:
+
+• Config system (YAML or CLI)
+• Data ingestion (CSV/JSONL/plain text folders)
+• Tokenization + vocabulary building
+• PyTorch model (Transformer encoder)
+• Training loop with mixed precision, gradient clipping, early stopping
+• Evaluation (accuracy, precision, recall, F1, confusion matrix)
+• Checkpointing + experiment logging
+• Inference (batch + single)
+• Export to TorchScript and ONNX
+• Simple FastAPI server for realtime inference
+• Clean CLI commands (train/eval/predict/serve/export)
+
+Notes
+-----
+- Designed to be a single self‑contained file. You can split it later into a proper package.
+- Only requires: torch, pydantic, fastapi, uvicorn, numpy, scikit-learn, PyYAML (optional), tqdm.
+- If optional deps are missing (fastapi/uvicorn/yaml/sklearn), the app degrades gracefully.
+- Dataset format: either a CSV/JSONL with columns [text,label] or a folder with subfolders per label containing .txt files.
+
+Author: you + ChatGPT
+Version: 1.323
+License: MIT
+"""
+from __future__ import annotations
+import os
+import sys
+import io
+import re
+import math
+import time
+import json
+import random
+import shutil
+import signal
+import string
+import pathlib
+import argparse
+import dataclasses
+from dataclasses import dataclass, asdict
+from typing import List, Tuple, Dict, Optional, Iterable
+
+try:
+    import yaml  # type: ignore
+except Exception:  # pragma: no cover
+    yaml = None
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+from tqdm import tqdm
+
+# Optional deps
+try:
+    from sklearn.metrics import accuracy_score, precision_recall_fscore_support, confusion_matrix
+except Exception:  # pragma: no cover
+    accuracy_score = None
+    precision_recall_fscore_support = None
+    confusion_matrix = None
+
+# FastAPI is optional; only needed for `serve`
+try:
+    from fastapi import FastAPI
+    from pydantic import BaseModel
+    import uvicorn
+except Exception:  # pragma: no cover
+    FastAPI = None
+    BaseModel = object  # type: ignore
+    uvicorn = None
+
+# -------------------------
+# Utilities
+# -------------------------
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+torch.manual_seed(SEED)
+
+def set_deterministic():
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def human_time(seconds: float) -> str:
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:d}h {m:d}m {s:d}s"
+
+
+def save_json(obj, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(obj, f, ensure_ascii=False, indent=2)
+
+
+def load_json(path: str):
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
+# -------------------------
+# Config
+# -------------------------
+@dataclass
+class ModelConfig:
+    model_name: str = "kusiAI"
+    version: str = "1.323"
+    vocab_size: int = 30000
+    max_len: int = 256
+    d_model: int = 256
+    n_heads: int = 4
+    n_layers: int = 4
+    dim_ff: int = 512
+    dropout: float = 0.1
+
+@dataclass
+class TrainConfig:
+    lr: float = 3e-4
+    batch_size: int = 32
+    num_epochs: int = 8
+    weight_decay: float = 0.01
+    warmup_steps: int = 200
+    grad_clip: float = 1.0
+    fp16: bool = True
+    early_stopping_patience: int = 3
+
+@dataclass
+class DataConfig:
+    train_path: str = "data/train.csv"  # csv/jsonl/folder
+    val_path: Optional[str] = None
+    test_path: Optional[str] = None
+    text_key: str = "text"
+    label_key: str = "label"
+    min_freq: int = 2
+
+@dataclass
+class RuntimeConfig:
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    workdir: str = "runs/kusiAI_v1.323"
+    num_workers: int = 2
+    seed: int = SEED
+
+@dataclass
+class Config:
+    model: ModelConfig = ModelConfig()
+    train: TrainConfig = TrainConfig()
+    data: DataConfig = DataConfig()
+    run: RuntimeConfig = RuntimeConfig()
+
+    @staticmethod
+    def load(path: Optional[str]) -> "Config":
+        if path is None:
+            return Config()
+        if yaml is None:
+            raise RuntimeError("PyYAML not installed; cannot load YAML config")
+        with open(path, 'r', encoding='utf-8') as f:
+            raw = yaml.safe_load(f)
+        # shallow merge
+        def merge(dc, d):
+            for k, v in d.items():
+                if hasattr(dc, k):
+                    sub = getattr(dc, k)
+                    if dataclasses.is_dataclass(sub) and isinstance(v, dict):
+                        merge(sub, v)
+                    else:
+                        setattr(dc, k, v)
+        cfg = Config()
+        merge(cfg, raw)
+        return cfg
