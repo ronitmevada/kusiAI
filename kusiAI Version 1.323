@@ -291,3 +291,266 @@ def load_dataset(path: str, text_key: str, label_key: str) -> Tuple[List[str], L
         return read_folder_dataset(path)
     return read_tabular_dataset(path, text_key, label_key)
 
+# -------------------------
+# Model
+# -------------------------
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, dropout=0.1, max_len=5000):
+        super().__init__()
+        self.dropout = nn.Dropout(p=dropout)
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
+    def forward(self, x):
+        x = x + self.pe[:, :x.size(1)]
+        return self.dropout(x)
+
+class KusiAITransformer(nn.Module):
+    def __init__(self, vocab_size: int, num_classes: int, d_model=256, n_heads=4, n_layers=4, dim_ff=512, dropout=0.1):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, d_model, padding_idx=0)
+        self.posenc = PositionalEncoding(d_model, dropout)
+        enc_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=n_heads, dim_feedforward=dim_ff, dropout=dropout, batch_first=True, activation='gelu')
+        self.encoder = nn.TransformerEncoder(enc_layer, num_layers=n_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.cls = nn.Linear(d_model, num_classes)
+    def forward(self, x):
+        mask = (x == 0)
+        h = self.embed(x)
+        h = self.posenc(h)
+        h = self.encoder(h, src_key_padding_mask=mask)
+        h = self.norm(h)
+        # mean pooling excluding pads
+        lengths = (~mask).sum(dim=1, keepdim=True).clamp(min=1)
+        pooled = (h * (~mask).unsqueeze(-1)).sum(dim=1) / lengths
+        return self.cls(pooled)
+
+# -------------------------
+# Training & Evaluation
+# -------------------------
+class WarmupLinearSchedule(torch.optim.lr_scheduler._LRScheduler):
+    def __init__(self, optimizer, warmup_steps, total_steps, last_epoch=-1):
+        self.warmup_steps = warmup_steps
+        self.total_steps = max(total_steps, warmup_steps + 1)
+        super().__init__(optimizer, last_epoch)
+    def get_lr(self):
+        step = self.last_epoch
+        lrs = []
+        for base_lr in self.base_lrs:
+            if step < self.warmup_steps:
+                lr = base_lr * float(step + 1) / float(max(1, self.warmup_steps))
+            else:
+                progress = float(step - self.warmup_steps) / float(max(1, self.total_steps - self.warmup_steps))
+                lr = base_lr * max(0.0, 1.0 - progress)
+            lrs.append(lr)
+        return lrs
+
+
+def compute_metrics(y_true, y_pred, labels: List[str]) -> Dict[str, float]:
+    if accuracy_score is None:
+        # minimal metrics without sklearn
+        acc = float((y_true == y_pred).mean())
+        return {"accuracy": acc}
+    acc = accuracy_score(y_true, y_pred)
+    p, r, f1, _ = precision_recall_fscore_support(y_true, y_pred, average='weighted', zero_division=0)
+    cm = confusion_matrix(y_true, y_pred).tolist()
+    return {"accuracy": float(acc), "precision": float(p), "recall": float(r), "f1": float(f1), "confusion_matrix": cm}
+
+
+def evaluate(model, dl, device, labels: List[str]) -> Dict[str, float]:
+    model.eval()
+    ys, ps = [], []
+    with torch.no_grad():
+        for xb, yb in dl:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            logits = model(xb)
+            pred = torch.argmax(logits, dim=-1)
+            ys.append(yb.cpu().numpy())
+            ps.append(pred.cpu().numpy())
+    y_true = np.concatenate(ys)
+    y_pred = np.concatenate(ps)
+    return compute_metrics(y_true, y_pred, labels)
+
+
+def train_loop(model, train_dl, val_dl, cfg: Config, labels: List[str], workdir: str) -> Dict[str, float]:
+    device = cfg.run.device
+    model.to(device)
+    opt = torch.optim.AdamW(model.parameters(), lr=cfg.train.lr, weight_decay=cfg.train.weight_decay)
+    total_steps = len(train_dl) * max(1, cfg.train.num_epochs)
+    sched = WarmupLinearSchedule(opt, cfg.train.warmup_steps, total_steps)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=cfg.train.fp16 and device.startswith('cuda'))
+
+    best_val = -1.0
+    patience = cfg.train.early_stopping_patience
+    best_path = os.path.join(workdir, 'best.pt')
+
+    os.makedirs(workdir, exist_ok=True)
+
+    global_step = 0
+    start = time.time()
+    for epoch in range(1, cfg.train.num_epochs + 1):
+        model.train()
+        pbar = tqdm(train_dl, desc=f"Epoch {epoch}/{cfg.train.num_epochs}")
+        running_loss = 0.0
+        for xb, yb in pbar:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            opt.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
+                logits = model(xb)
+                loss = F.cross_entropy(logits, yb)
+            scaler.scale(loss).backward()
+            if cfg.train.grad_clip:
+                scaler.unscale_(opt)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.train.grad_clip)
+            scaler.step(opt)
+            scaler.update()
+            sched.step()
+            running_loss += loss.item()
+            global_step += 1
+            if global_step % 20 == 0:
+                pbar.set_postfix({"loss": f"{running_loss / max(1, global_step):.4f}", "lr": f"{sched.get_last_lr()[0]:.2e}"})
+        # end epoch: evaluate
+        val_metrics = evaluate(model, val_dl, device, labels)
+        val_f1 = float(val_metrics.get("f1", val_metrics.get("accuracy", 0.0)))
+        # save checkpoint
+        torch.save({
+            "model_state": model.state_dict(),
+            "config": asdict(cfg),
+            "labels": labels,
+            "step": global_step,
+            "epoch": epoch,
+        }, os.path.join(workdir, f"epoch_{epoch}.pt"))
+        if val_f1 > best_val:
+            best_val = val_f1
+            torch.save(model.state_dict(), best_path)
+            save_json({"best_val": best_val, "epoch": epoch, "time_sec": time.time() - start}, os.path.join(workdir, 'best.json'))
+            patience = cfg.train.early_stopping_patience
+        else:
+            patience -= 1
+            if patience <= 0:
+                print("Early stopping triggered.")
+                break
+    elapsed = human_time(time.time() - start)
+    print(f"Training completed in {elapsed}. Best val metric: {best_val:.4f}")
+    return {"best_val": best_val}
+
+# -------------------------
+# Orchestration
+# -------------------------
+@dataclass
+class Artifacts:
+    vocab_path: str
+    labels_path: str
+    model_path: str
+
+
+def build_artifacts_dir(workdir: str) -> Artifacts:
+    os.makedirs(workdir, exist_ok=True)
+    return Artifacts(
+        vocab_path=os.path.join(workdir, 'vocab.json'),
+        labels_path=os.path.join(workdir, 'labels.json'),
+        model_path=os.path.join(workdir, 'best.pt'),
+    )
+
+
+def prepare_dataloaders(cfg: Config, split_ratio: float = 0.9):
+    texts, labels_idx, classes = load_dataset(cfg.data.train_path, cfg.data.text_key, cfg.data.label_key)
+    # shuffle
+    idx = list(range(len(texts)))
+    random.shuffle(idx)
+    texts = [texts[i] for i in idx]
+    labels_idx = [labels_idx[i] for i in idx]
+
+    # vocab
+    vocab = Vocab(min_freq=cfg.data.min_freq, max_size=cfg.model.vocab_size)
+    vocab.build(texts)
+
+    # split
+    n_train = int(len(texts) * split_ratio)
+    train_records = list(zip(texts[:n_train], labels_idx[:n_train]))
+    val_records = list(zip(texts[n_train:], labels_idx[n_train:]))
+
+    train_ds = TextClassificationDataset(train_records, vocab, cfg.model.max_len)
+    val_ds = TextClassificationDataset(val_records, vocab, cfg.model.max_len)
+
+    train_dl = DataLoader(train_ds, batch_size=cfg.train.batch_size, shuffle=True, num_workers=cfg.run.num_workers)
+    val_dl = DataLoader(val_ds, batch_size=cfg.train.batch_size, shuffle=False, num_workers=cfg.run.num_workers)
+
+    return train_dl, val_dl, vocab, classes
+
+
+def save_vocab_and_labels(vocab: Vocab, labels: List[str], artifacts: Artifacts):
+    save_json({"itos": vocab.itos}, artifacts.vocab_path)
+    save_json({"labels": labels}, artifacts.labels_path)
+
+
+def load_vocab_and_labels(artifacts: Artifacts) -> Tuple[Vocab, List[str]]:
+    vj = load_json(artifacts.vocab_path)
+    lj = load_json(artifacts.labels_path)
+    v = Vocab()
+    v.itos = vj["itos"]
+    v.stoi = {w: i for i, w in enumerate(v.itos)}
+    return v, lj["labels"]
+
+
+def train_command(cfg: Config):
+    set_deterministic()
+    artifacts = build_artifacts_dir(cfg.run.workdir)
+    train_dl, val_dl, vocab, labels = prepare_dataloaders(cfg)
+    model = KusiAITransformer(
+        vocab_size=len(vocab),
+        num_classes=len(labels),
+        d_model=cfg.model.d_model,
+        n_heads=cfg.model.n_heads,
+        n_layers=cfg.model.n_layers,
+        dim_ff=cfg.model.dim_ff,
+        dropout=cfg.model.dropout,
+    )
+    save_vocab_and_labels(vocab, labels, artifacts)
+    metrics = train_loop(model, train_dl, val_dl, cfg, labels, cfg.run.workdir)
+    print("Train done:", metrics)
+
+
+def eval_command(cfg: Config):
+    artifacts = build_artifacts_dir(cfg.run.workdir)
+    v, labels = load_vocab_and_labels(artifacts)
+    # load val/test set
+    path = cfg.data.val_path or cfg.data.test_path or cfg.data.train_path
+    texts, y, _ = load_dataset(path, cfg.data.text_key, cfg.data.label_key)
+    ds = TextClassificationDataset(list(zip(texts, y)), v, cfg.model.max_len)
+    dl = DataLoader(ds, batch_size=cfg.train.batch_size, shuffle=False, num_workers=cfg.run.num_workers)
+    model = KusiAITransformer(len(v), len(labels), cfg.model.d_model, cfg.model.n_heads, cfg.model.n_layers, cfg.model.dim_ff, cfg.model.dropout)
+    device = cfg.run.device
+    model.load_state_dict(torch.load(artifacts.model_path, map_location=device))
+    model.to(device)
+    metrics = evaluate(model, dl, device, labels)
+    print(json.dumps(metrics, indent=2))
+
+
+def predict_batch(model, vocab: Vocab, texts: List[str], max_len: int, device: str) -> List[int]:
+    model.eval()
+    ids = torch.tensor([vocab.encode(t, max_len) for t in texts], dtype=torch.long).to(device)
+    with torch.no_grad():
+        logits = model(ids)
+        preds = torch.argmax(logits, dim=-1).cpu().tolist()
+    return preds
+
+
+def predict_command(cfg: Config, input_texts: List[str]):
+    artifacts = build_artifacts_dir(cfg.run.workdir)
+    vocab, labels = load_vocab_and_labels(artifacts)
+    device = cfg.run.device
+    model = KusiAITransformer(len(vocab), len(labels), cfg.model.d_model, cfg.model.n_heads, cfg.model.n_layers, cfg.model.dim_ff, cfg.model.dropout)
+    model.load_state_dict(torch.load(artifacts.model_path, map_location=device))
+    model.to(device)
+    preds = predict_batch(model, vocab, input_texts, cfg.model.max_len, device)
+    for t, p in zip(input_texts, preds):
+        print(json.dumps({"text": t, "label": labels[p], "label_id": p}, ensure_ascii=False))
+
